@@ -28,7 +28,7 @@ limitations under the License.
 =head1 SYNOPSIS
 
  mv AlphaGenome.pm ~/.vep/Plugins
- ./vep -i variations.vcf --plugin AlphaGenome,file=/path/to/alphageome_scores.tsv.gz
+ ./vep -i variations.vcf --plugin AlphaGenome,file=/path/to/alphagenome_scores.tsv.gz
 
 =head1 DESCRIPTION
 
@@ -49,11 +49,10 @@ limitations under the License.
    SPLICE_JUNCTIONS   - Splice junction counts (donor-acceptor pairs)
    CONTACT_MAPS       - 3D chromatin interaction maps
 
- The plugin reads a tabix-indexed TSV file containing scores exported from the
- AlphaGenome Python SDK via the tidy_scores() function.
-
- By default all modalities are reported. Use the 'modalities' parameter to
- restrict output to specific modalities of interest.
+ The plugin reads a tabix-indexed TSV file in wide format with one row per
+ variant and pre-aggregated top scores per modality. The data preparation step
+ aggregates the full AlphaGenome tidy_scores() output (thousands of rows per
+ variant across cell types and tracks) into a single row per variant.
 
  Please cite the AlphaGenome publication alongside Ensembl VEP if you use
  this resource:
@@ -65,37 +64,52 @@ limitations under the License.
 
   file        : (required) Path to tabix-indexed AlphaGenome scores TSV
 
-  cutoff      : Minimum absolute raw score to report (default: 0, report all)
+  cutoff      : Minimum absolute raw score to report a modality
+                (default: 0, report all)
 
-  quantile_cutoff : Minimum absolute quantile score to report (default: 0)
+  quantile_cutoff : Minimum absolute quantile score to report a modality
+                    (default: 0)
 
-  modalities  : Colon-separated list of modalities to include
+  modalities  : Plus-separated list of modalities to include
                 (default: all modalities)
-                Example: modalities=SPLICE_JUNCTIONS:SPLICE_SITES:RNA_SEQ
+                Example: modalities=SPLICE_JUNCTIONS+SPLICE_SITES+RNA_SEQ
 
  Output:
 
-  For tab/VCF output the result is reported as a pipe-delimited string:
-    GENE_NAME|OUTPUT_TYPE|TRACK_NAME|RAW_SCORE|QUANTILE_SCORE
-  When multiple modalities/tracks pass filters, the highest absolute raw
-  score result is reported.
+  The plugin reports one VEP field per modality:
+    AlphaGenome_GENE_ID       - Ensembl gene ID (top-scoring gene)
+    AlphaGenome_GENE_NAME     - Gene symbol (top-scoring gene)
+    AlphaGenome_ATAC          - ATAC raw_score/quantile_score
+    AlphaGenome_CAGE          - CAGE raw_score/quantile_score
+    AlphaGenome_CHIP_HISTONE  - ChIP histone raw_score/quantile_score
+    AlphaGenome_CHIP_TF       - ChIP TF raw_score/quantile_score
+    AlphaGenome_CONTACT_MAPS  - Contact maps raw_score/quantile_score
+    AlphaGenome_DNASE         - DNase raw_score/quantile_score
+    AlphaGenome_PROCAP        - PRO-cap raw_score/quantile_score
+    AlphaGenome_RNA_SEQ       - RNA-seq raw_score/quantile_score
+    AlphaGenome_SPLICE_JUNCTIONS   - Splice junctions raw_score/quantile_score
+    AlphaGenome_SPLICE_SITES       - Splice sites raw_score/quantile_score
+    AlphaGenome_SPLICE_SITE_USAGE  - Splice site usage raw_score/quantile_score
 
-  For JSON output, all passing results are returned as:
-    "AlphaGenome": [
-      {"gene_id": "...", "gene_name": "...", "output_type": "...",
-       "track_name": "...", "raw_score": ..., "quantile_score": ...},
-      ...
-    ]
+  Score format: RAW_SCORE/QUANTILE_SCORE (e.g. -0.0234/0.876)
+
+  For JSON output, a structured hash is returned with all fields.
 
  Data preparation:
 
   1. Run AlphaGenome batch variant scoring using the Python SDK
   2. Export scores via tidy_scores() to a pandas DataFrame
-  3. Write to TSV with columns:
-       #CHROM  POS  REF  ALT  GENE_ID  GENE_NAME  OUTPUT_TYPE  TRACK_NAME  RAW_SCORE  QUANTILE_SCORE
+  3. Aggregate to wide format (one row per variant) with columns:
+       #CHROM  POS  REF  ALT  GENE_ID  GENE_NAME  ATAC  CAGE
+       CHIP_HISTONE  CHIP_TF  CONTACT_MAPS  DNASE  PROCAP  RNA_SEQ
+       SPLICE_JUNCTIONS  SPLICE_SITES  SPLICE_SITE_USAGE
+     Each modality column contains: RAW_SCORE/QUANTILE_SCORE
+     GENE_ID/GENE_NAME: gene with highest absolute score across
+     gene-centric modalities, or "." if none.
+     Use "." for modalities without scores.
   4. Sort, compress and index:
-       sort -k1,1 -k2,2n alphageome_scores.tsv | bgzip -c > alphageome_scores.tsv.gz
-       tabix -s 1 -b 2 -e 2 alphageome_scores.tsv.gz
+       sort -k1,1 -k2,2n alphagenome_scores.tsv | bgzip -c > alphagenome_scores.tsv.gz
+       tabix -s 1 -b 2 -e 2 alphagenome_scores.tsv.gz
 
  The tabix utility must be installed in your path to use this plugin.
  Check https://github.com/samtools/htslib.git for instructions.
@@ -111,10 +125,19 @@ use Bio::EnsEMBL::Variation::Utils::Sequence qw(get_matched_variant_alleles);
 use Bio::EnsEMBL::Variation::Utils::BaseVepTabixPlugin;
 use base qw(Bio::EnsEMBL::Variation::Utils::BaseVepTabixPlugin);
 
-my %VALID_MODALITIES = map { $_ => 1 } qw(
-  RNA_SEQ CAGE PROCAP DNASE ATAC CHIP_HISTONE CHIP_TF
-  SPLICE_SITES SPLICE_SITE_USAGE SPLICE_JUNCTIONS CONTACT_MAPS
+my @MODALITIES = qw(
+  ATAC CAGE CHIP_HISTONE CHIP_TF CONTACT_MAPS DNASE PROCAP
+  RNA_SEQ SPLICE_JUNCTIONS SPLICE_SITES SPLICE_SITE_USAGE
 );
+
+my %VALID_MODALITIES = map { $_ => 1 } @MODALITIES;
+
+# Column indices in the wide-format TSV
+my %COL_IDX;
+my $idx = 0;
+for my $col (qw(CHROM POS REF ALT GENE_ID GENE_NAME), @MODALITIES) {
+  $COL_IDX{$col} = $idx++;
+}
 
 sub new {
   my $class = shift;
@@ -130,7 +153,7 @@ sub new {
   # File parameter is required
   my $file = $params->{file};
   die "ERROR: file parameter is required for AlphaGenome plugin, e.g.:\n" .
-    "  --plugin AlphaGenome,file=/path/to/alphageome_scores.tsv.gz\n"
+    "  --plugin AlphaGenome,file=/path/to/alphagenome_scores.tsv.gz\n"
     unless $file;
 
   $self->add_file($file);
@@ -143,7 +166,7 @@ sub new {
 
   # Parse modality filter
   if (defined($params->{modalities})) {
-    my @mods = split(/:/, $params->{modalities});
+    my @mods = split(/\+/, $params->{modalities});
     my %mod_filter;
     for my $m (@mods) {
       die "ERROR: Unknown modality '$m'. Valid modalities are: " .
@@ -164,11 +187,18 @@ sub feature_types {
 sub get_header_info {
   my $self = shift;
 
-  return {
-    AlphaGenome => 'AlphaGenome variant effect predictions. ' .
-      'Format: GENE_NAME|OUTPUT_TYPE|TRACK_NAME|RAW_SCORE|QUANTILE_SCORE. ' .
-      'See https://www.nature.com/articles/s41586-025-10014-0'
-  };
+  my $cite = 'See https://www.nature.com/articles/s41586-025-10014-0';
+  my %header = (
+    AlphaGenome_GENE_ID   => "AlphaGenome top-scoring gene Ensembl ID. $cite",
+    AlphaGenome_GENE_NAME => "AlphaGenome top-scoring gene symbol. $cite",
+  );
+
+  for my $mod (@MODALITIES) {
+    $header{"AlphaGenome_$mod"} =
+      "AlphaGenome $mod variant effect score (raw_score/quantile_score). $cite";
+  }
+
+  return \%header;
 }
 
 sub run {
@@ -193,8 +223,6 @@ sub run {
 
   return {} unless @data;
 
-  my @passing_results;
-
   foreach my $row (@data) {
     # Match alleles
     my $matches = get_matched_variant_alleles(
@@ -212,59 +240,47 @@ sub run {
     );
     next unless @$matches;
 
+    # Wide format: one row per variant, so first match is the result
     my $result = $row->{result};
+    my %output;
 
-    # Apply modality filter
-    if ($self->{modality_filter}) {
-      next unless $self->{modality_filter}{$result->{output_type}};
+    # Gene info
+    my $gene_id   = $result->{gene_id};
+    my $gene_name = $result->{gene_name};
+    $output{AlphaGenome_GENE_ID}   = $gene_id   if defined($gene_id)   && $gene_id   ne '.';
+    $output{AlphaGenome_GENE_NAME} = $gene_name  if defined($gene_name) && $gene_name ne '.';
+
+    # Modality scores
+    for my $mod (@MODALITIES) {
+      # Apply modality filter
+      if ($self->{modality_filter}) {
+        next unless $self->{modality_filter}{$mod};
+      }
+
+      my $val = $result->{$mod};
+      next unless defined($val) && $val ne '.';
+
+      # Parse raw_score/quantile_score
+      my ($raw, $quantile) = split(/\//, $val, 2);
+
+      # Apply raw score cutoff
+      if ($self->{cutoff} > 0) {
+        next unless defined($raw) && $raw ne '' && abs($raw) >= $self->{cutoff};
+      }
+
+      # Apply quantile score cutoff
+      if ($self->{quantile_cutoff} > 0) {
+        next unless defined($quantile) && $quantile ne '' &&
+          abs($quantile) >= $self->{quantile_cutoff};
+      }
+
+      $output{"AlphaGenome_$mod"} = $val;
     }
 
-    # Apply raw score cutoff
-    if ($self->{cutoff} > 0) {
-      next unless defined($result->{raw_score}) &&
-        $result->{raw_score} ne '.' &&
-        abs($result->{raw_score}) >= $self->{cutoff};
-    }
-
-    # Apply quantile score cutoff
-    if ($self->{quantile_cutoff} > 0) {
-      next unless defined($result->{quantile_score}) &&
-        $result->{quantile_score} ne '.' &&
-        abs($result->{quantile_score}) >= $self->{quantile_cutoff};
-    }
-
-    push @passing_results, $result;
+    return \%output if %output;
   }
 
-  return {} unless @passing_results;
-
-  # JSON output: return all passing results
-  if ($self->{config}->{output_format} eq 'json' || $self->{config}->{rest}) {
-    return {
-      AlphaGenome => \@passing_results
-    };
-  }
-
-  # Tab/VCF output: return the top-scoring result as pipe-delimited string
-  my $top = $passing_results[0];
-  my $top_abs = abs($top->{raw_score} || 0);
-  for my $r (@passing_results[1..$#passing_results]) {
-    my $abs = abs($r->{raw_score} || 0);
-    if ($abs > $top_abs) {
-      $top = $r;
-      $top_abs = $abs;
-    }
-  }
-
-  return {
-    AlphaGenome => join('|',
-      $top->{gene_name}      // '.',
-      $top->{output_type}    // '.',
-      $top->{track_name}     // '.',
-      $top->{raw_score}      // '.',
-      $top->{quantile_score} // '.',
-    )
-  };
+  return {};
 }
 
 sub parse_data {
@@ -272,19 +288,21 @@ sub parse_data {
   chomp $line;
   my @f = split /\t/, $line;
 
+  my %result = (
+    gene_id   => $f[$COL_IDX{GENE_ID}],
+    gene_name => $f[$COL_IDX{GENE_NAME}],
+  );
+
+  for my $mod (@MODALITIES) {
+    $result{$mod} = $f[$COL_IDX{$mod}];
+  }
+
   return {
-    chr   => $f[0],
-    start => $f[1],
-    ref   => $f[2],
-    alt   => $f[3],
-    result => {
-      gene_id        => $f[4],
-      gene_name      => $f[5],
-      output_type    => $f[6],
-      track_name     => $f[7],
-      raw_score      => $f[8],
-      quantile_score => $f[9],
-    }
+    chr    => $f[$COL_IDX{CHROM}],
+    start  => $f[$COL_IDX{POS}],
+    ref    => $f[$COL_IDX{REF}],
+    alt    => $f[$COL_IDX{ALT}],
+    result => \%result,
   };
 }
 
